@@ -1,5 +1,13 @@
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import sys
+
+stdout = sys.stdout
+stderr = sys.stderr
+
+log_file = open('log', 'w')
+sys.stdout = log_file
+sys.stderr = log_file
 
 cxx_args = ['-std=c++14']
 
@@ -24,3 +32,13 @@ setup(
         ], extra_compile_args={'cxx': cxx_args, 'nvcc': nvcc_args}),
     ],
     cmdclass={'build_ext': BuildExtension})
+
+# Make sure to close the log file. You could also use with to surround the setup()
+# To ensure log file is closed in the event of exception.
+log_file.close()
+
+sys.stdout = stdout
+sys.stderr = stderr
+
+with open('log', 'r') as log_file:
+    sys.stdout.write(log_file.read())
