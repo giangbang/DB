@@ -137,7 +137,8 @@ class SegDetector(nn.Module):
         if self.training:
             result = OrderedDict(binary=binary)
         else:
-            return binary
+            thresh = self.thresh(fuse)
+            return (binary > thresh).float()
         if self.adaptive and self.training:
             if self.serial:
                 fuse = torch.cat(
