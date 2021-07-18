@@ -32,6 +32,10 @@ class BasicBlock(nn.Module):
     expansion = 1
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, dcn=None):
+    '''
+    inplanes: in channels
+    planes: out channels
+    '''
         super(BasicBlock, self).__init__()
         self.with_dcn = dcn is not None
         self.conv1 = conv3x3(inplanes, planes, stride)

@@ -195,33 +195,62 @@ __global__ void deformable_im2col_gpu_kernel(const int n, const scalar_t *data_i
                                              const int height_col, const int width_col,
                                              scalar_t *data_col)
 {
+  // batch_size is im2col_step, or S, and = 64
+  // num_channels is input channels, think of it as c in (b x c x h x w) of the input shape
+  // data_im : [S x C x H x W]
+  // data_offset  : [S x 18 x H x W]
+  // data_col: [(C * 9) x (S * H * W)], the sampling values at each cnn kernel after applying the offset effect
+  // n = C x S x H x W
   CUDA_KERNEL_LOOP(index, n)
   {
     // index index of output matrix
-    const int w_col = index % width_col;
-    const int h_col = (index / width_col) % height_col;
-    const int b_col = (index / width_col / height_col) % batch_size;
-    const int c_im = (index / width_col / height_col) / batch_size;
-    const int c_col = c_im * kernel_h * kernel_w;
+    const int w_col = index % width_col;  // index w.r.t width axis, or W-index
+    const int h_col = (index / width_col) % height_col;  // index w.r.t height axis, or H-index
+    const int b_col = (index / width_col / height_col) % batch_size; // index of instance inside a S-batch, or S-index
+    const int c_im = (index / width_col / height_col) / batch_size; // index of S-batch, since we are slicing a 'batch' to many im2col_step chunks, C-index
+    const int c_col = c_im * kernel_h * kernel_w;  // 9 x batch_index, or 9*C-index
 
     // compute deformable group index
+    // channel_per_deformable_group = C / group
     const int deformable_group_index = c_im / channel_per_deformable_group;
 
-    const int h_in = h_col * stride_h - pad_h;
-    const int w_in = w_col * stride_w - pad_w;
-    scalar_t *data_col_ptr = data_col + ((c_col * batch_size + b_col) * height_col + h_col) * width_col + w_col;
+    const int h_in = h_col * stride_h - pad_h; // integral coord
+    const int w_in = w_col * stride_w - pad_w; 
+    
+    // a pointer points to the current data index in data_col w.r.t this thread
+    // every thread will update its 9 respective values in the data_col
+    // data_col: [(C * 9) x (S * H * W)]
+    scalar_t *data_col_ptr = data_col + // ~ data_col[c_im, 0, b_col, h_col, w_col]
+                            ((c_col * batch_size + b_col) * height_col + h_col) * width_col
+                            + w_col;
     //const scalar_t* data_im_ptr = data_im + ((b_col * num_channels + c_im) * height + h_in) * width + w_in;
-    const scalar_t *data_im_ptr = data_im + (b_col * num_channels + c_im) * height * width;
-    const scalar_t *data_offset_ptr = data_offset + (b_col * deformable_group + deformable_group_index) * 2 * kernel_h * kernel_w * height_col * width_col;
+    
+    // data_im is a segment of data input tensor, it has a shape [S x C x H x W]
+    // points to the beginning of every HxW chunk
+    const scalar_t *data_im_ptr = data_im + // ~ data_im[b_col, c_im, 0, 0]
+                                  (b_col * num_channels + c_im) * height * width;
+                                  
+    // data_offset  : [S x 18 x H x W]
+    // points to the beginning of S-axis
+    const scalar_t *data_offset_ptr = data_offset + // ~ data_offset[b_col, 0, 0, 0]
+          (b_col * deformable_group + deformable_group_index) * 2 * kernel_h * kernel_w * height_col * width_col;
 
     for (int i = 0; i < kernel_h; ++i)
     {
       for (int j = 0; j < kernel_w; ++j)
       {
+        // imagine devide data_offset to [S x 9 x 2 x H x W]
+        // the pointer data_col_ptr will iterate through S at every step and update its value
+        // kH x kW x H x W
         const int data_offset_h_ptr = ((2 * (i * kernel_w + j)) * height_col + h_col) * width_col + w_col;
         const int data_offset_w_ptr = ((2 * (i * kernel_w + j) + 1) * height_col + h_col) * width_col + w_col;
+        
+        // data_offset_ptr[i, j, h_col, w_col]
         const scalar_t offset_h = data_offset_ptr[data_offset_h_ptr];
+        
+        // data_offset_ptr[i, j + 1, h_col, w_col]
         const scalar_t offset_w = data_offset_ptr[data_offset_w_ptr];
+        
         scalar_t val = static_cast<scalar_t>(0);
         const scalar_t h_im = h_in + i * dilation_h + offset_h;
         const scalar_t w_im = w_in + j * dilation_w + offset_w;
@@ -242,17 +271,18 @@ __global__ void deformable_im2col_gpu_kernel(const int n, const scalar_t *data_i
 }
 
 void deformable_im2col(
-    const at::Tensor data_im, const at::Tensor data_offset, const int channels,
+    const at::Tensor data_im, const at::Tensor data_offset, const int channels, // in channels
     const int height, const int width, const int ksize_h, const int ksize_w,
     const int pad_h, const int pad_w, const int stride_h, const int stride_w,
-    const int dilation_h, const int dilation_w, const int parallel_imgs,
+    const int dilation_h, const int dilation_w, const int parallel_imgs, // im2col_step
     const int deformable_group, at::Tensor data_col)
 {
   // num_axes should be smaller than block size
   // todo: check parallel_imgs is correctly passed in
-  int height_col = (height + 2 * pad_h - (dilation_h * (ksize_h - 1) + 1)) / stride_h + 1;
-  int width_col = (width + 2 * pad_w - (dilation_w * (ksize_w - 1) + 1)) / stride_w + 1;
-  int num_kernels = channels * height_col * width_col * parallel_imgs;
+  int height_col = (height + 2 * pad_h - (dilation_h * (ksize_h - 1) + 1)) / stride_h + 1; // output height
+  int width_col = (width + 2 * pad_w - (dilation_w * (ksize_w - 1) + 1)) / stride_w + 1;  // output width
+  int num_kernels = channels * height_col * width_col * parallel_imgs; // size of data when flattened, convenient for cuda call
+  // num_kernels = C x H x W x S
   int channel_per_deformable_group = channels / deformable_group;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
@@ -261,6 +291,7 @@ void deformable_im2col(
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
         scalar_t *data_col_ = data_col.data<scalar_t>();
 
+        // process every chunk of size [64 x ]
         deformable_im2col_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_im_, data_offset_, height, width, ksize_h, ksize_w,
             pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
@@ -578,14 +609,20 @@ __global__ void modulated_deformable_im2col_gpu_kernel(const int n,
                                                        const int height_col, const int width_col,
                                                        scalar_t *data_col)
 {
+  // n = C * 1 * H * W
+  // batch = 1
+  // data_col = (C * 9) x (1H*W)
+  // data_im = [C x H x W]
+  // data_offset: [18 x H x W]
+  // data_mask : 9 x H x W
   CUDA_KERNEL_LOOP(index, n)
   {
     // index index of output matrix
-    const int w_col = index % width_col;
-    const int h_col = (index / width_col) % height_col;
-    const int b_col = (index / width_col / height_col) % batch_size;
-    const int c_im = (index / width_col / height_col) / batch_size;
-    const int c_col = c_im * kernel_h * kernel_w;
+    const int w_col = index % width_col; // W index
+    const int h_col = (index / width_col) % height_col; // H index
+    const int b_col = (index / width_col / height_col) % batch_size; // always = 0
+    const int c_im = (index / width_col / height_col) / batch_size;  // C index
+    const int c_col = c_im * kernel_h * kernel_w; // 9C
 
     // compute deformable group index
     const int deformable_group_index = c_im / channel_per_deformable_group;
@@ -593,17 +630,23 @@ __global__ void modulated_deformable_im2col_gpu_kernel(const int n,
     const int h_in = h_col * stride_h - pad_h;
     const int w_in = w_col * stride_w - pad_w;
 
-    scalar_t *data_col_ptr = data_col + ((c_col * batch_size + b_col) * height_col + h_col) * width_col + w_col;
+    scalar_t *data_col_ptr = data_col + // data_col[c_im, b_col, h_col, width_col]
+                    ((c_col * batch_size + b_col) * height_col + h_col) * width_col
+                     + w_col;
     //const float* data_im_ptr = data_im + ((b_col * num_channels + c_im) * height + h_in) * width + w_in;
-    const scalar_t *data_im_ptr = data_im + (b_col * num_channels + c_im) * height * width;
-    const scalar_t *data_offset_ptr = data_offset + (b_col * deformable_group + deformable_group_index) * 2 * kernel_h * kernel_w * height_col * width_col;
+    const scalar_t *data_im_ptr = data_im + // data_im[b_col, c_im, 0, 0]
+                                (b_col * num_channels + c_im) * height * width;
+    const scalar_t *data_offset_ptr = data_offset + // data_offset[0, 0, 0]
+                (b_col * deformable_group + deformable_group_index) * 2 * kernel_h * kernel_w * height_col * width_col;
 
-    const scalar_t *data_mask_ptr = data_mask + (b_col * deformable_group + deformable_group_index) * kernel_h * kernel_w * height_col * width_col;
+    const scalar_t *data_mask_ptr = data_mask + // data_mask[0, 0, 0]
+                (b_col * deformable_group + deformable_group_index) * kernel_h * kernel_w * height_col * width_col;
 
     for (int i = 0; i < kernel_h; ++i)
     {
       for (int j = 0; j < kernel_w; ++j)
       {
+        // data_offset[i, j, h-col, w_col]
         const int data_offset_h_ptr = ((2 * (i * kernel_w + j)) * height_col + h_col) * width_col + w_col;
         const int data_offset_w_ptr = ((2 * (i * kernel_w + j) + 1) * height_col + h_col) * width_col + w_col;
         const int data_mask_hw_ptr = ((i * kernel_w + j) * height_col + h_col) * width_col + w_col;

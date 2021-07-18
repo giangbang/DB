@@ -199,7 +199,7 @@ int deform_conv_forward_cuda(at::Tensor input, at::Tensor weight,
   output = output.view({batchSize / im2col_step, im2col_step, nOutputPlane,
                         outputHeight, outputWidth});
   columns = at::zeros(
-      {nInputPlane * kW * kH, im2col_step * outputHeight * outputWidth},
+      {nInputPlane * kW * kH, im2col_step * outputHeight * outputWidth},  // (Cx9xSxHxW)
       input.options());
 
   if (ones.ndimension() != 2 ||
@@ -215,41 +215,41 @@ int deform_conv_forward_cuda(at::Tensor input, at::Tensor weight,
 
   at::Tensor output_buffer =
       at::zeros({batchSize / im2col_step, nOutputPlane,
-                 im2col_step * outputHeight, outputWidth},
+                 im2col_step * outputHeight, outputWidth},  // (N/S) x C' x (S*H) x W
                 output.options());
 
   output_buffer = output_buffer.view(
       {output_buffer.size(0), group, output_buffer.size(1) / group,
-       output_buffer.size(2), output_buffer.size(3)});
+       output_buffer.size(2), output_buffer.size(3)});  // (N/S) x 1 x C' x (S*H) x W
 
   for (int elt = 0; elt < batchSize / im2col_step; elt++) {
     deformable_im2col(input[elt], offset[elt], nInputPlane, inputHeight,
                       inputWidth, kH, kW, padH, padW, dH, dW, dilationH,
                       dilationW, im2col_step, deformable_group, columns);
 
-    columns = columns.view({group, columns.size(0) / group, columns.size(1)});
+    columns = columns.view({group, columns.size(0) / group, columns.size(1)}); // 1 x (9C) x (SHW)
     weight = weight.view({group, weight.size(0) / group, weight.size(1),
-                          weight.size(2), weight.size(3)});
+                          weight.size(2), weight.size(3)});  // 1x C' x C x 3 x 3
 
     for (int g = 0; g < group; g++) {
       output_buffer[elt][g] = output_buffer[elt][g]
                                   .flatten(1)
-                                  .addmm_(weight[g].flatten(1), columns[g])
+                                  .addmm_(weight[g].flatten(1), columns[g])  // [C' x (C9)] __matmul__ [(9C) x (SHW)]
                                   .view_as(output_buffer[elt][g]);
     }
   }
 
   output_buffer = output_buffer.view(
       {output_buffer.size(0), output_buffer.size(1) * output_buffer.size(2),
-       output_buffer.size(3), output_buffer.size(4)});
+       output_buffer.size(3), output_buffer.size(4)});  // (N/S) x C' x (S*H) x W
 
   output_buffer = output_buffer.view({batchSize / im2col_step, nOutputPlane,
-                                      im2col_step, outputHeight, outputWidth});
-  output_buffer.transpose_(1, 2);
+                                      im2col_step, outputHeight, outputWidth}); // (N/S) x C' x S x H x W
+  output_buffer.transpose_(1, 2);  // (N/S) x S x C' x H x W
   output.copy_(output_buffer);
-  output = output.view({batchSize, nOutputPlane, outputHeight, outputWidth});
+  output = output.view({batchSize, nOutputPlane, outputHeight, outputWidth}); // N x C' x H x W
 
-  input = input.view({batchSize, nInputPlane, inputHeight, inputWidth});
+  input = input.view({batchSize, nInputPlane, inputHeight, inputWidth}); // restore original view
   offset = offset.view(
       {batchSize, deformable_group * 2 * kH * kW, outputHeight, outputWidth});
 
@@ -529,12 +529,12 @@ void modulated_deform_conv_cuda_forward(
   // resize output
   output = output.view({batch, channels_out, height_out, width_out}).zero_();
   // resize temporary columns
-  columns =
+  columns =  // (C * 9) x (H*W)
       at::zeros({channels * kernel_h * kernel_w, 1 * height_out * width_out},
                 input.options());
 
   output = output.view({output.size(0), group, output.size(1) / group,
-                        output.size(2), output.size(3)});
+                        output.size(2), output.size(3)}); // N x S x C/S x H x W
 
   for (int b = 0; b < batch; b++) {
     modulated_deformable_im2col_cuda(
@@ -544,13 +544,13 @@ void modulated_deform_conv_cuda_forward(
 
     // divide into group
     weight = weight.view({group, weight.size(0) / group, weight.size(1),
-                          weight.size(2), weight.size(3)});
+                          weight.size(2), weight.size(3)}); // 1 x C' x C x K x K
     columns = columns.view({group, columns.size(0) / group, columns.size(1)});
 
     for (int g = 0; g < group; g++) {
       output[b][g] = output[b][g]
                          .flatten(1)
-                         .addmm_(weight[g].flatten(1), columns[g])
+                         .addmm_(weight[g].flatten(1), columns[g]) // C' x (C9) --mm-- C9 x HW
                          .view_as(output[b][g]);
     }
 
